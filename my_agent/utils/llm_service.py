@@ -34,10 +34,11 @@ class OpenAIGPT(BaseChatModel):
     temperature: Optional[float] = 0
     max_tokens: Optional[int] = 256 
     client: OpenAI = Field(default=None, exclude=True)
-    bound_tools: Optional[Any] = None       # ✅ was: dict = None
-    structured_schema: Optional[Any] = None # ✅ was: dict = None (wrong, can be Pydantic class)
+    bound_tools: Optional[Any] = None       
+    structured_schema: Optional[Any] = None
+    n_retry: int = 5 
     
-    def __init__(self, model: str = 'llama3.1', bound_tools=None, structured_schema=None):
+    def __init__(self, model: str = 'llama3.1', bound_tools=None, structured_schema=None, n_retry: int = 5):
         super().__init__()
         self.bound_tools = bound_tools
         self.structured_schema = structured_schema
@@ -45,6 +46,7 @@ class OpenAIGPT(BaseChatModel):
         base_url: str = os.environ['MODEL_URL']
         self.client = OpenAI(api_key=api_key, base_url=base_url)
         self.model = model
+        self.n_retry = n_retry
 
     def _generate(self, messages, stop=None, callbacks=None, **kwargs):
         if self.bound_tools:
@@ -93,76 +95,104 @@ class OpenAIGPT(BaseChatModel):
     def bind_tools(self, tools, *, tool_choice=None, **kwargs):
         formatted_tools = [convert_to_openai_tool(tool) for tool in tools]
         return self.__class__(
-            model=self.model,           # ✅ was missing — model was reset to default
+            model=self.model,         
             bound_tools=formatted_tools
         )
 
     def with_structured_output(self, schema, *, include_raw: bool = False, **kwargs):
         return self.__class__(
-            model=self.model,           # ✅ was missing — model was reset to default
+            model=self.model,           
             bound_tools=None,
             structured_schema=schema
         )
 
-    def _format_messages_for_tools(self, messages):
+    def _format_messages_for_tools(self, messages: list):
+        messages = messages.copy()
         tool_system_instruction = (
             f"You are a helpful AI assistant with tool calling ability.\n"
             f"Use a tool when the user's request matches one. Otherwise respond normally.\n"
             f"When calling a tool respond ONLY with a JSON object in this exact format:\n"
-            f'  {{"name": "<function_name>", "parameters": {{"arg": "value"}}}}\n'
+            f'{{"name": "<function_name>", "parameters": {{"arg": "value"}}}}\n'
             f"Do not include any other text when calling a tool.\n\n"
             f"Available tools:\n{json.dumps(self.bound_tools, indent=2)}"
         )
+
+        # Change the current system prompt instruction to tool calling instruction
         system_prompt_changed = False
         for msg in messages:
             if isinstance(msg, SystemMessage):
                 msg.content = tool_system_instruction
                 system_prompt_changed = True
+
+        # if system prompt not found, add system_message with new instruction        
         if not system_prompt_changed:
             messages.insert(0, SystemMessage(content=tool_system_instruction))
         return messages
 
     def _call_model_with_tool(self, messages):
+        retry_left = self.n_retry
+        
+        # setup of tool instruction system prompt
         messages = self._format_messages_for_tools(messages)
-        messages = convert_to_openai_messages(messages)
-        response = self.client.chat.completions.create(
-            messages=messages,
-            model=self.model,
-            stream=False,
-            max_tokens=self.max_tokens,
-        )
-        raw_output = response.choices[0].message.content.strip()
 
-        json_match = re.search(r'^\s*\{[\s\S]*\}\s*$', raw_output)
-        if json_match:
-            try:
-                tool_json = json.loads(json_match.group(0))
-            except json.JSONDecodeError:
-                try:
-                    tool_json = json.loads(json_match.group(0).replace("'", '"'))
-                except json.JSONDecodeError:
-                    return ChatResult(generations=[ChatGeneration(message=AIMessage(content=raw_output))])
-
-            message = AIMessage(
-                content='',
-                tool_calls=[
-                    ToolCall(
-                        name=tool_json.get("name"),
-                        args=tool_json.get("parameters", {}),
-                        id=str(uuid.uuid4())
-                    )
-                ]
+        while retry_left > 0:
+            retry_left -= 1 
+            openai_messages = convert_to_openai_messages(messages)
+            response = self.client.chat.completions.create(
+                messages=openai_messages,
+                model=self.model,
+                stream=False,
+                max_tokens=self.max_tokens,
             )
-        else:
-            message = AIMessage(content=raw_output)
+            raw_output = response.choices[0].message.content.strip()
+            json_match = re.search(r'^\s*\{[\s\S]*\}\s*$', raw_output) # there can be a bug here, what if we don't match any json
 
+            if json_match:
+                try:
+                    tool_json = json.loads(json_match.group(0))
+                    message = AIMessage(
+                                content='',
+                                tool_calls=[
+                                    ToolCall(
+                                        name=tool_json.get("name"),
+                                        args=tool_json.get("parameters", {}),
+                                        id=str(uuid.uuid4())
+                            )
+                        ]
+                    )   
+                    return ChatResult(generations=[ChatGeneration(message=message)])
+                          
+                except json.JSONDecodeError as e:
+                    human_content = f"""The output you given has error when i try to parse it:,
+                    ### The output you given:
+                    {raw_output}
+                    ### Error
+                    {e}
+                    please try one more time and i will give your raw output for json parsing"""
+                    
+                    messages.extends([
+                        AIMessage(content=raw_output),
+                        HumanMessage(content=human_content)
+                    ])
+        
+            else: # if json parsing couldn't find any json match, retry with issue
+                human_content = f"""The output you given has issue while parsing to json, re.search(r'^\s*\{{[\s\S]*\}}\s*$', your_output) couldn't match any match:
+                ### Your output:
+                {raw_output}
+                please try one more time."""
+                messages.extend([
+                    AIMessage(content=raw_output),
+                    HumanMessage(content=human_content)
+                ])
+        
+        # message = AIMessage(content=raw_output)
+        message = AIMessage(content="Coulndn't use tool, json parsing issue")
         return ChatResult(generations=[ChatGeneration(message=message)])
 
     def _call_model_with_schema(self, messages):
         pydantic_parser = None
 
-        # ✅ Must check it's a class first before calling issubclass
-        # issubclass on a plain dict throws TypeError
+        # Must check it's a class first before calling issubclass
         if isinstance(self.structured_schema, type) and issubclass(self.structured_schema, BaseModel):
             pydantic_parser = PydanticOutputParser(pydantic_object=self.structured_schema)
             schema = self.structured_schema.model_json_schema()
