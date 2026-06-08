@@ -186,7 +186,7 @@ class OpenAIGPT(BaseChatModel):
                 ])
         
         # message = AIMessage(content=raw_output)
-        message = AIMessage(content="Coulndn't use tool, json parsing issue")
+        message = AIMessage(content=f"Tool parsing failed.\n\nLast output:\n{raw_output}")
         return ChatResult(generations=[ChatGeneration(message=message)])
 
     def _call_model_with_schema(self, messages):
