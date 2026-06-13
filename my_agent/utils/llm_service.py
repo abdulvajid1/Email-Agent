@@ -80,6 +80,7 @@ class OpenAIGPT(BaseChatModel):
             chunk = ChatGenerationChunk(message=message_chunk)
             yield chunk
 
+
     @property
     def _llm_type(self) -> str:
         return self.model
