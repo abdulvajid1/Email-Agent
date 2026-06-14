@@ -5,7 +5,8 @@ from langchain_core.messages import (SystemMessage,
                                      HumanMessage, 
                                      AIMessage, AnyMessage)
 
-from langgraph.graph import START, StateGraph, add_messages, END
+from langgraph.graph import START, StateGraph, END
+from langgraph.graph.message import add_messages, MessagesState
 from typing import TypedDict
 
 llm = ChatOllama(model="qwen3.5", reasoning=True)
