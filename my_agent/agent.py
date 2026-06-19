@@ -9,31 +9,33 @@ from langchain_core.messages import (
     AIMessageChunk,
 )
 from langgraph.prebuilt import tools_condition
-from mcp_client import MCP_SERVERS
-from langchain_mcp_adapters.client import MultiServerMCPClient
+
 import asyncio
 from typing import Annotated, TypedDict
+from langsmith import traceable
 
+from tools import get_tools
 
-mcp_client = MultiServerMCPClient(MCP_SERVERS)  # type: ignore
+from dotenv import load_dotenv
 
+load_dotenv()
 
 # State definition
 class MyState(TypedDict):
     messages: Annotated[list[AnyMessage], add_messages]
 
 
-async def build_webagent():
-    llm = ChatOllama(model="qwen3.5", reasoning=True)
-    web_tool = await mcp_client.get_tools(server_name="web_search")
-    llm = llm.bind_tools(web_tool)
+async def build_webagent(llm, tools=None):
+    if tools is not None:
+        llm = llm.bind_tools(tools)
+        web_tool = tools[0]
 
     def chat_node(state: MyState):
         messages = state.get("messages", [])
         assert messages != [], "No messages found in state."
         response = llm.invoke(messages)
         return {"messages": response}
-
+    
     async def tool_execute_node(state: MyState, config):
         messages = state.get("messages", "")
         assert messages != [], "No messages found in state."
@@ -41,7 +43,7 @@ async def build_webagent():
         # Take only one toolcall from the tool called list
         # this will broke if model decides to call more than one call
         web_tool_call = last_ai_msg.tool_calls[0]  # type: ignore
-        tool_message = await web_tool[0].ainvoke(web_tool_call)
+        tool_message = await web_tool.ainvoke(web_tool_call) # type: ignore
         return {"messages": [tool_message]}
 
     graph = StateGraph(MyState)
@@ -60,7 +62,9 @@ async def build_webagent():
 
 
 async def main():
-    graph = await build_webagent()
+    llm = ChatOllama(model="qwen3.5", reasoning=True)
+    tools = await get_tools()
+    graph = await build_webagent(llm, tools)
 
     state: MyState = {
         "messages": [
